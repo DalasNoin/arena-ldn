@@ -32,15 +32,19 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     t.nn.init.constant_(layer.bias, bias_const)
     return layer
 
-class Agent(nn.Module):
-    critic: nn.Sequential
-    actor: nn.Sequential
-
+class BaseAgent(nn.Module):
     def __init__(self, envs: gym.vector.SyncVectorEnv):
         super().__init__()
         self.obs_shape = envs.single_observation_space.shape[0]
         self.num_actions = envs.single_action_space.n
         self.hidden_size = 64
+
+class Agent(BaseAgent):
+    critic: nn.Sequential
+    actor: nn.Sequential
+
+    def __init__(self, envs: gym.vector.SyncVectorEnv):
+        super().__init__(envs = envs)
 
         # todo init layers
         final_critic_linear = nn.Linear(self.hidden_size,1)
@@ -58,6 +62,38 @@ class Agent(nn.Module):
                                         nn.Linear(self.hidden_size, self.hidden_size),
                                         nn.Tanh(),
                                         final_actor_linear)
+
+class ConvAgent(BaseAgent):
+
+    def __init__(self, envs: gym.vector.SyncVectorEnv):
+        super().__init__(envs = envs)
+        # todo init layers
+        self.final_critic_linear = nn.Linear(self.hidden_size,1)
+        layer_init(self.final_critic_linear, std=1)
+        self.final_actor_linear = nn.Linear(self.hidden_size,self.num_actions)
+        layer_init(self.final_actor_linear, std=0.01)
+        self.norm_constant = 256
+
+        self.actor_critic = nn.Sequential(nn.Conv2d(in_channels=3, out_channels=16, kernel_size=3, stride=2, padding=1),
+                                        nn.GELU(),
+                                        nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=2, padding=1),
+                                        nn.GELU(),
+                                        nn.Conv2d(in_channels=32, out_channels=self.hidden_size, kernel_size=3, stride=2, padding=1),
+                                        nn.GELU())
+
+    def actor(self, x):
+        x = rearrange(x, "b h w c -> b c h w") /self.norm_constant
+        x = self.actor_critic(x)
+        x = torch.amax(x, dim=(2,3))
+        x = self.final_actor_linear(x)
+        return x
+
+    def critic(self, x):
+        x = rearrange(x, "b h w c -> b c h w") /self.norm_constant
+        x = self.actor_critic(x)
+        x = torch.amax(x, dim=(2,3))
+        x = self.final_critic_linear(x)
+        return x
 
 @t.inference_mode()
 def compute_advantages(
@@ -228,7 +264,7 @@ class PPOScheduler:
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = lr
 
-def make_optimizer(agent: Agent, num_updates: int, initial_lr: float, end_lr: float) -> tuple[optim.Adam, PPOScheduler]:
+def make_optimizer(agent: BaseAgent, num_updates: int, initial_lr: float, end_lr: float) -> tuple[optim.Adam, PPOScheduler]:
     '''Return an appropriately configured Adam with its attached scheduler.'''
     adam = optim.Adam(agent.parameters(), lr=initial_lr, maximize=True)
     scheduler = PPOScheduler(adam, initial_lr=initial_lr, end_lr=end_lr, num_updates=num_updates)
@@ -262,6 +298,7 @@ class PPOArgs:
 
 def train_ppo(args):
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = run_name.replace(":", "-")
     if args.track:
         import wandb
 
@@ -290,7 +327,10 @@ def train_ppo(args):
     action_shape = envs.single_action_space.shape
     assert action_shape is not None
     assert isinstance(envs.single_action_space, Discrete), "only discrete action space is supported"
-    agent = Agent(envs).to(device)
+    if "procgen" in args.env_id:
+        agent = ConvAgent(envs).to(device)
+    else:
+        agent = Agent(envs).to(device)
     num_updates = args.total_timesteps // args.batch_size
     (optimizer, scheduler) = make_optimizer(agent, num_updates, args.learning_rate, 0.0)
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -402,10 +442,12 @@ def train_ppo(args):
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+        writer.add_scalar("charts/mean_returns", t.mean(mb.returns), global_step)
         if global_step % 10 == 0:
             print("steps per second (SPS):", int(global_step / (time.time() - start_time)))
     envs.close()
     writer.close()
+    return agent
 
 
 from gym.envs.classic_control.cartpole import CartPoleEnv
@@ -419,11 +461,24 @@ class EasyCart(CartPoleEnv):
         (obs, rew, done, info) = super().step(action)
         "YOUR CODE HERE"
         position = obs[0]  #     | 0   | Cart Position         | -4.8                | 4.8               |
-        position = (position + 4.8) / 9.6
+        position = np.abs(position /9.6)+0.5
         return obs, rew*position, done, info
 
 gym.envs.registration.register(id="EasyCart-v0", entry_point=EasyCart, max_episode_steps=500)
 
+from gym.envs.classic_control.mountain_car import MountainCarEnv
+
+class EasyCar(MountainCarEnv):
+    def step(self, action):
+        (obs, rew, done, info) = super().step(action)
+        "YOUR CODE HERE"
+        height = self._height(obs[0])
+        velocity = obs[1] * 1e2
+        energy = height ** 2 + velocity ** 2
+
+        return obs, energy + rew, done, info
+
+gym.envs.registration.register(id="EasyCar-v0", entry_point=EasyCar, max_episode_steps=500)
 
 if MAIN:
     if "ipykernel_launcher" in os.path.basename(sys.argv[0]):
@@ -432,6 +487,6 @@ if MAIN:
         args = PPOArgs()
     else:
         args = ppo_parse_args()
-        args.env_id = "EasyCart-v0"
+        # args.env_id = "EasyCar-v0"
     train_ppo(args)
 

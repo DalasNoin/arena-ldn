@@ -8,20 +8,28 @@ import os
 import random
 import torch as t
 Arr = np.ndarray
+from procgen import ProcgenGym3Env
 
 # %%
 def make_env(env_id: str, seed: int, idx: int, capture_video: bool, run_name: str):
     """Return a function that returns an environment after setting up boilerplate."""
     
     def thunk():
-        env = gym.make(env_id)
+        env = gym.make(env_id, render_mode="rgb_array")
+        # env = ProcgenGym3Env(num=1, env_name="coinrun", render_mode="rgb_array")
+        # breakpoint()
+        env.metadata["render.modes"] = ["human", "rgb_array"]
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if capture_video:
             if idx == 0:
                 env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        obs = env.reset(seed=seed)
-        env.action_space.seed(seed)
-        env.observation_space.seed(seed)
+                # env = gym.wrappers.VideoRecorderWrapper(env=env, directory="./videos", force=True)
+        # obs = env.reset(seed=seed)
+        # env.action_space.seed(seed)
+        # env.observation_space.seed(seed)
+        obs = env.reset()
+        env.action_space.seed()
+        env.observation_space.seed()
         return env
     
     return thunk
